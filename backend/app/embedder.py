@@ -29,9 +29,10 @@ _chroma_client = chromadb.EphemeralClient()
 
 # Reuse the same embedding function instance across calls to avoid reloading the
 # model weights on every request.
-_embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
-)
+# DefaultEmbeddingFunction uses the all-MiniLM-L6-v2 model via chromadb's own
+# lightweight onnxruntime backend (~80 MB), avoiding the heavier
+# sentence-transformers dependency (~500 MB+).
+_embedding_fn = embedding_functions.DefaultEmbeddingFunction()
 
 
 # ---------------------------------------------------------------------------
