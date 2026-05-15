@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse
 from app.models import HealthResponse, QueryRequest, QueryResponse, UploadResponse
 from app.pdf_processor import extract_text
 from app.chunker import chunk_pages
-from app.embedder import embed_and_store, _chroma_client
+from app.embedder import embed_and_store
 from app.retriever import retrieve
 from app.ai_client import generate_answer
 from app.session import get_session, set_session
@@ -152,25 +152,12 @@ def query_document(request: QueryRequest) -> QueryResponse:
 
 @app.get("/health", response_model=HealthResponse)
 def health_check() -> JSONResponse:
-    """Return the operational status of the service and its dependencies.
-
-    Attempts a ChromaDB heartbeat to verify that the vector store is reachable.
+    """Return the operational status of the service.
 
     Returns:
-        HTTP 200 with ``{"status": "ok"}`` when everything is healthy.
-        HTTP 503 with ``{"status": "degraded", "detail": "ChromaDB unreachable"}``
-        when ChromaDB cannot be reached.
+        HTTP 200 with ``{"status": "ok"}``.
     """
-    try:
-        _chroma_client.heartbeat()
-        return JSONResponse(
-            status_code=200,
-            content=HealthResponse(status="ok").model_dump(exclude_none=True),
-        )
-    except Exception:
-        return JSONResponse(
-            status_code=503,
-            content=HealthResponse(
-                status="degraded", detail="ChromaDB unreachable"
-            ).model_dump(),
-        )
+    return JSONResponse(
+        status_code=200,
+        content=HealthResponse(status="ok").model_dump(exclude_none=True),
+    )

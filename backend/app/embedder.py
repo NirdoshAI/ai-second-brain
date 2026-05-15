@@ -1,98 +1,133 @@
 """
 Embedder module for the AI Second Brain backend.
 
-This module is responsible for generating vector embeddings from text chunks and
-storing them in ChromaDB. It exposes a single public function, `embed_and_store`,
-which replaces the active-session collection on every call so that each new PDF
-upload starts with a clean slate.
+Uses a lightweight in-memory TF-IDF store instead of a neural embedding model,
+keeping RAM usage well under 100 MB so the app runs on Render's free tier.
 
-The ChromaDB client is created once at import time as a module-level singleton so
-that the same in-memory database is reused across all requests within a single
-server process lifetime.
+The single public function ``embed_and_store`` replaces the active session on
+every call so that each new PDF upload starts with a clean slate.
 """
 
 import json
-
-import chromadb
-import chromadb.utils.embedding_functions as embedding_functions
+import math
+import re
+from collections import Counter
 
 from app.models import Chunk
 
 # ---------------------------------------------------------------------------
-# Module-level constants and singletons
+# Module-level in-memory store
 # ---------------------------------------------------------------------------
 
-COLLECTION_NAME = "active_session"
+# Each entry: {"chunk": Chunk, "tf": {term: freq}}
+_store: list[dict] = []
 
-# EphemeralClient keeps everything in memory — no disk persistence needed for MVP.
-_chroma_client = chromadb.EphemeralClient()
+# IDF cache: {term: idf_score} — rebuilt on every upload
+_idf: dict[str, float] = {}
 
-# Reuse the same embedding function instance across calls to avoid reloading the
-# model weights on every request.
-# DefaultEmbeddingFunction uses the all-MiniLM-L6-v2 model via chromadb's own
-# lightweight onnxruntime backend (~80 MB), avoiding the heavier
-# sentence-transformers dependency (~500 MB+).
-_embedding_fn = embedding_functions.DefaultEmbeddingFunction()
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase and split text into word tokens."""
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _build_tf(tokens: list[str]) -> dict[str, float]:
+    """Compute term frequency (normalised) for a token list."""
+    counts = Counter(tokens)
+    total = max(len(tokens), 1)
+    return {term: count / total for term, count in counts.items()}
+
+
+def _build_idf(tfs: list[dict[str, float]]) -> dict[str, float]:
+    """Compute IDF scores across all documents."""
+    n = len(tfs)
+    idf: dict[str, float] = {}
+    # Collect all unique terms
+    all_terms: set[str] = set()
+    for tf in tfs:
+        all_terms.update(tf.keys())
+    for term in all_terms:
+        doc_count = sum(1 for tf in tfs if term in tf)
+        idf[term] = math.log((n + 1) / (doc_count + 1)) + 1.0
+    return idf
+
+
+def _tfidf_vector(tf: dict[str, float], idf: dict[str, float]) -> dict[str, float]:
+    """Multiply TF by IDF to get a TF-IDF vector."""
+    return {term: tf_val * idf.get(term, 1.0) for term, tf_val in tf.items()}
+
+
+def _cosine_similarity(a: dict[str, float], b: dict[str, float]) -> float:
+    """Compute cosine similarity between two sparse TF-IDF vectors."""
+    common = set(a.keys()) & set(b.keys())
+    if not common:
+        return 0.0
+    dot = sum(a[t] * b[t] for t in common)
+    norm_a = math.sqrt(sum(v * v for v in a.values()))
+    norm_b = math.sqrt(sum(v * v for v in b.values()))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-
 def embed_and_store(chunks: list[Chunk]) -> int:
-    """Embed *chunks* and store them in the ChromaDB active-session collection.
+    """Index *chunks* using TF-IDF and store them in the in-memory store.
 
-    The existing ``active_session`` collection (if any) is deleted before a new
-    one is created, satisfying the requirement that each upload starts with a
-    fresh vector store (Requirement 3.5).
-
-    ChromaDB computes the embeddings automatically using the
-    ``SentenceTransformerEmbeddingFunction`` attached to the collection, so this
-    function only needs to supply raw text documents and metadata.
-
-    ``page_numbers`` is JSON-serialised to a string because ChromaDB metadata
-    values must be scalars (Requirement 3.4).
+    Replaces any previously stored session so each upload starts fresh.
 
     Args:
         chunks: A list of :class:`~app.models.Chunk` objects produced by the
-            Chunker.  Must not be empty.
+            Chunker. Must not be empty.
 
     Returns:
         The number of chunks successfully stored (equal to ``len(chunks)``).
 
     Raises:
-        RuntimeError: If any ChromaDB operation fails.  The original exception
-            message is included so the FastAPI error handler can surface a
-            meaningful HTTP 500 response (Requirement 3.6).
+        RuntimeError: If indexing fails.
     """
+    global _store, _idf
     try:
-        # Delete the previous session collection if it exists so that a new
-        # upload never inherits stale embeddings from a prior PDF.
-        try:
-            _chroma_client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            # Collection did not exist — that is fine, nothing to delete.
-            pass
-
-        collection = _chroma_client.create_collection(
-            name=COLLECTION_NAME,
-            embedding_function=_embedding_fn,
-        )
-
-        ids = [chunk.id for chunk in chunks]
-        documents = [chunk.text for chunk in chunks]
-        metadatas = [
-            {
-                "source_file": chunk.source_file,
-                "page_numbers": json.dumps(chunk.page_numbers),
-            }
-            for chunk in chunks
-        ]
-
-        collection.add(ids=ids, documents=documents, metadatas=metadatas)
-
+        tfs = [_build_tf(_tokenize(chunk.text)) for chunk in chunks]
+        _idf = _build_idf(tfs)
+        _store = [{"chunk": chunk, "tf": tf} for chunk, tf in zip(chunks, tfs)]
         return len(chunks)
-
     except Exception as e:
         raise RuntimeError(f"Failed to store embeddings: {e}") from e
+
+
+def retrieve(question: str, n_results: int = 5) -> list[Chunk]:
+    """Return the top *n_results* chunks most relevant to *question*.
+
+    Args:
+        question: The natural-language question to search for.
+        n_results: Maximum number of chunks to return. Defaults to ``5``.
+
+    Returns:
+        A list of :class:`~app.models.Chunk` objects ordered by descending
+        relevance.
+
+    Raises:
+        LookupError: If no document has been uploaded yet.
+    """
+    if not _store:
+        raise LookupError("No document loaded. Please upload a PDF first.")
+
+    query_tf = _build_tf(_tokenize(question))
+    query_vec = _tfidf_vector(query_tf, _idf)
+
+    scored = []
+    for entry in _store:
+        doc_vec = _tfidf_vector(entry["tf"], _idf)
+        score = _cosine_similarity(query_vec, doc_vec)
+        scored.append((score, entry["chunk"]))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [chunk for _, chunk in scored[:n_results]]
